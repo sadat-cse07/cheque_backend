@@ -75,8 +75,10 @@ class Template extends Model
             $html .= '</div>';
         }
 
-        // Body
+        // Body - ✅ This will contain {{CHEQUE_TABLE}} which already has total + inwords
         $html .= '<div class="body">' . $this->replacePlaceholders($this->body_template, $data) . '</div>';
+
+        // ✅ NO extra total or inwords here - it's already inside {{CHEQUE_TABLE}}
 
         // Footer
         if ($this->footer) {

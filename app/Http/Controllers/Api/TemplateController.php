@@ -16,7 +16,7 @@ class TemplateController extends Controller
     public function store(Request $request)
     {
         $validated = $request->validate([
-            'name' => 'required|string|max:255|unique:templates',
+            'name' => 'required|string|max:255',
             'type' => 'required|string|max:50',
             'title' => 'nullable|string|max:500',
             'header' => 'nullable|string',
