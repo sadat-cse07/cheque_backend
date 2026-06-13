@@ -73,12 +73,13 @@ class ChequeController extends Controller
      * Store a newly created cheque (payment).
      * Includes comprehensive validation and transaction handling.
      */
+//
+
     public function store(Request $request)
     {
-        // $this->authorize('create', Cheque::class);
-
         $validated = $request->validate([
             'bank_id'          => 'required|exists:banks,id',
+            'bank_account_id'  => 'required|exists:bank_accounts,id',
             'cheque_number'    => 'required|string|max:50',
             'cheque_date'      => 'required|date',
             'vendor_id'        => 'required|exists:vendors,id',
@@ -86,95 +87,84 @@ class ChequeController extends Controller
             'amount_in_words'  => 'required|string|max:500',
             'voucher_ids'      => 'required|array|min:1',
             'voucher_ids.*'    => 'integer|exists:vouchers,id',
-        ], [
-            'voucher_ids.min' => 'At least one voucher must be selected.',
-            'voucher_ids.*.exists' => 'One or more selected vouchers are invalid.',
         ]);
 
-        // Additional validation: Bank must be active
-        $bank = Bank::find($validated['bank_id']);
-        if (!$bank || !$bank->is_active) {
-            return response()->json([
-                'message' => 'The selected bank is inactive or does not exist.',
-            ], 422);
-        }
-
-        // Check duplicate cheque number for the same bank
-        $existingCheque = Cheque::where('bank_id', $validated['bank_id'])
-            ->where('cheque_number', $validated['cheque_number'])
-            ->where('status', '!=', 'voided')
-            ->first();
-        if ($existingCheque) {
-            return response()->json([
-                'message' => 'This cheque number already exists for the selected bank.',
-            ], 422);
-        }
-
-        // Remove duplicate voucher IDs
-        $voucherIds = array_unique($validated['voucher_ids']);
-
         // Fetch vouchers
-        $vouchers = Voucher::whereIn('id', $voucherIds)->get();
+        $vouchers = Voucher::whereIn('id', $validated['voucher_ids'])
+            ->where('vendor_id', $validated['vendor_id'])
+            ->where('is_paid', false)
+            ->orderBy('voucher_date')  // FIFO: oldest first
+            ->get();
 
-        // Validate all vouchers exist
-        if ($vouchers->count() !== count($voucherIds)) {
-            return response()->json([
-                'message' => 'One or more voucher IDs are invalid.',
-            ], 422);
+        if ($vouchers->isEmpty()) {
+            return response()->json(['message' => 'No valid unpaid vouchers found.'], 422);
         }
 
-        // Validate all vouchers belong to the specified vendor
-        $voucherVendorIds = $vouchers->pluck('vendor_id')->unique();
-        if ($voucherVendorIds->count() !== 1) {
-            return response()->json([
-                'message' => 'All selected vouchers must belong to the same vendor.',
-            ], 422);
-        }
-        if ($voucherVendorIds->first() != $validated['vendor_id']) {
-            return response()->json([
-                'message' => 'All selected vouchers must belong to the cheque payee vendor.',
-            ], 422);
-        }
+        $totalAvailable = $vouchers->sum('amount');
+        $chequeAmount = $validated['amount'];
 
-        // Validate amount matches (with decimal tolerance)
-        $totalAmount = $vouchers->sum('amount');
-        if (abs($totalAmount - $validated['amount']) > 0.005) {
+        // ✅ Allow partial payment (amount can be less than or equal to total)
+        if ($chequeAmount > $totalAvailable) {
             return response()->json([
-                'message'          => 'Cheque amount does not match the total of selected vouchers.',
-                'voucher_total'    => round($totalAmount, 2),
-                'cheque_amount'    => round($validated['amount'], 2),
-                'difference'       => round(abs($totalAmount - $validated['amount']), 2),
-            ], 422);
-        }
-
-        // Validate no voucher is already paid
-        $alreadyPaid = $vouchers->where('is_paid', true);
-        if ($alreadyPaid->isNotEmpty()) {
-            return response()->json([
-                'message'       => 'Some selected vouchers have already been paid.',
-                'paid_vouchers' => $alreadyPaid->pluck('voucher_name')->toArray(),
+                'message' => 'Cheque amount exceeds the total of selected vouchers.',
+                'voucher_total' => round($totalAvailable, 2),
+                'cheque_amount' => round($chequeAmount, 2),
             ], 422);
         }
 
         // Persist in transaction
         try {
-            $cheque = DB::transaction(function () use ($validated, $voucherIds) {
+            $cheque = DB::transaction(function () use ($validated, $vouchers, $chequeAmount) {
                 // Create cheque
                 $cheque = Cheque::create([
-                    'bank_id'         => $validated['bank_id'],
-                    'cheque_number'   => $validated['cheque_number'],
-                    'cheque_date'     => $validated['cheque_date'],
-                    'vendor_id'       => $validated['vendor_id'],
-                    'amount'          => $validated['amount'],
-                    'amount_in_words' => $validated['amount_in_words'],
-                    'status'          => 'active',
+                    'bank_id'          => $validated['bank_id'],
+                    'bank_account_id'  => $validated['bank_account_id'],
+                    'cheque_number'    => $validated['cheque_number'],
+                    'cheque_date'      => $validated['cheque_date'],
+                    'vendor_id'        => $validated['vendor_id'],
+                    'amount'           => $chequeAmount,
+                    'amount_in_words'  => $validated['amount_in_words'],
+                    'status'           => 'active',
                 ]);
 
-                // Attach vouchers
-                $cheque->vouchers()->attach($voucherIds);
+                // ✅ FIFO: Apply payment to vouchers
+                $remaining = $chequeAmount;
+                $paidVoucherIds = [];
+                $partialVoucherId = null;
+                $partialAmount = 0;
 
-                // Mark all attached vouchers as paid
-                Voucher::whereIn('id', $voucherIds)->update(['is_paid' => true]);
+                foreach ($vouchers as $voucher) {
+                    if ($remaining <= 0) break;
+
+                    if ($remaining >= $voucher->amount) {
+                        // Full payment for this voucher
+                        $remaining -= $voucher->amount;
+                        $paidVoucherIds[] = $voucher->id;
+                        Voucher::where('id', $voucher->id)->update(['is_paid' => true]);
+                    } else {
+                        // Partial payment for this voucher
+                        $partialVoucherId = $voucher->id;
+                        $partialAmount = $remaining;
+
+                        // Create a new voucher for remaining amount
+                        $newVoucher = Voucher::create([
+                            'voucher_date' => $voucher->voucher_date,
+                            'particulars' => $voucher->particulars . ' (Balance)',
+                            'voucher_name' => $voucher->voucher_name . '-BAL',
+                            'vendor_id' => $voucher->vendor_id,
+                            'amount' => $voucher->amount - $remaining,
+                            'is_paid' => false,
+                        ]);
+
+                        // Mark original as paid
+                        Voucher::where('id', $voucher->id)->update(['is_paid' => true]);
+                        $paidVoucherIds[] = $voucher->id;
+                        $remaining = 0;
+                    }
+                }
+
+                // Attach all original voucher IDs to cheque
+                $cheque->vouchers()->attach($validated['voucher_ids']);
 
                 return $cheque;
             });
@@ -186,17 +176,10 @@ class ChequeController extends Controller
             ], 201);
 
         } catch (\Exception $e) {
-            \Log::error('Cheque creation failed: ' . $e->getMessage(), [
-                'user_id' => $request->user()?->id,
-                'data'    => $validated,
-            ]);
-
-            return response()->json([
-                'message' => 'An unexpected error occurred while creating the cheque. Please try again.',
-            ], 500);
+            \Log::error('Cheque creation failed: ' . $e->getMessage());
+            return response()->json(['message' => 'An unexpected error occurred.'], 500);
         }
     }
-
     /**
      * Display the specified cheque with all relationships.
      */
@@ -357,4 +340,6 @@ class ChequeController extends Controller
 
         return response()->json($stats);
     }
+
+
 }

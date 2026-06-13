@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\Api\BankAccountController;
 use App\Http\Controllers\Api\TemplateController;
 use App\Http\Controllers\Api\TemplateDocumentController;
 use App\Http\Controllers\Api\TemplateLetterController;
@@ -43,3 +44,8 @@ Route::apiResource('template-documents', TemplateDocumentController::class);
 Route::post('template-documents/{document}/generate', [TemplateDocumentController::class, 'generate']);
 Route::get('template-documents/{document}/print', [TemplateDocumentController::class, 'printData']);
 Route::post('template-documents/bulk-print', [TemplateDocumentController::class, 'bulkPrint']);
+
+
+// Bank Accounts
+Route::apiResource('bank-accounts', BankAccountController::class);
+Route::get('banks/{bank}/accounts', [BankAccountController::class, 'byBank']);

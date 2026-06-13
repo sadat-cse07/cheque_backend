@@ -128,4 +128,10 @@ class Cheque extends Model
     {
         return $this->status === 'active';
     }
+
+    // Add this relationship
+    public function bankAccount(): BelongsTo
+    {
+        return $this->belongsTo(BankAccount::class);
+    }
 }
